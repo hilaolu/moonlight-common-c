@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "InputStreamPolicy.h"
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
@@ -579,8 +580,14 @@ static void inputSendThreadProc(void* context) {
             continue;
         }
 
+        // Keyboard and wheel packets are semantic barriers. Send them now even
+        // if more FIFO entries are waiting so ENet cannot defer the transition.
+        bool moreData = !inputPacketIsFlushBarrier(holder->channelId,
+                                                    holder->packet.header.magic) &&
+                        LbqGetItemCount(&packetQueue) > 0;
+
         // Encrypt and send the input packet
-        if (!sendInputPacket(holder, LbqGetItemCount(&packetQueue) > 0)) {
+        if (!sendInputPacket(holder, moreData)) {
             freePacketHolder(holder);
             return;
         }

@@ -117,3 +117,19 @@ target_include_directories(moonlight-common-c SYSTEM PRIVATE
 )
 
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
+
+if (CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+  include(CTest)
+  if (BUILD_TESTING)
+    add_executable(input-stream-policy-test tests/InputStreamPolicyTest.c)
+    target_include_directories(input-stream-policy-test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/enet/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/nanors
+      ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps
+      ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
+    )
+    target_compile_definitions(input-stream-policy-test PRIVATE HAS_SOCKLEN_T)
+    add_test(NAME input-stream-policy-test COMMAND input-stream-policy-test)
+  endif()
+endif()
