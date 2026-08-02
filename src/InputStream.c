@@ -1,10 +1,12 @@
 #include "Limelight-internal.h"
 #include "InputStreamPolicy.h"
+#include "OrderedInputPolicy.h"
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
 static bool initialized;
 static bool encryptedControlStream;
+static uint8_t keyboardChannelId = CTRL_CHANNEL_KEYBOARD;
 static bool needsBatchedScroll;
 static int batchedScrollDelta;
 static PPLT_CRYPTO_CONTEXT cryptoContext;
@@ -52,6 +54,7 @@ typedef struct _PACKET_HOLDER {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
     uint32_t enetPacketFlags;
     uint8_t channelId;
+    uint64_t enqueueTimeUs;
 
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
@@ -87,6 +90,9 @@ static struct {
 // Initializes the input stream
 int initializeInputStream(void) {
     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
+    keyboardChannelId = orderedInputChannel(CTRL_CHANNEL_KEYBOARD,
+                                            &StreamConfig,
+                                            SunshineFeatureFlags);
 
     // Set a high maximum queue size limit to ensure input isn't dropped
     // while the input send thread is blocked for short periods.
@@ -202,24 +208,174 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
         // but this is on purpose. It allows us assume we have a full holder even
         // if packetLength < sizeof(*holder) and put this allocation into the free
         // list.
-        return malloc(sizeof(*holder) + extraLength);
-    }
-
-    // Grab an entry from the free list (if available)
-    err = LbqPollQueueElement(&packetHolderFreeList, (void**)&holder);
-    if (err == LBQ_SUCCESS) {
-        return holder;
-    }
-    else if (err == LBQ_INTERRUPTED) {
-        // We're shutting down. Don't bother allocating.
-        return NULL;
+        holder = malloc(sizeof(*holder) + extraLength);
     }
     else {
-        LC_ASSERT(err == LBQ_NO_ELEMENT);
+        // Grab an entry from the free list (if available)
+        err = LbqPollQueueElement(&packetHolderFreeList, (void**)&holder);
+        if (err == LBQ_INTERRUPTED) {
+            // We're shutting down. Don't bother allocating.
+            holder = NULL;
+        }
+        else if (err != LBQ_SUCCESS) {
+            LC_ASSERT(err == LBQ_NO_ELEMENT);
 
-        // Otherwise we'll have to allocate
-        return malloc(sizeof(*holder));
+            // Otherwise we'll have to allocate
+            holder = malloc(sizeof(*holder));
+        }
     }
+
+    if (holder != NULL) {
+        holder->enqueueTimeUs = PltGetMicroseconds();
+    }
+
+    return holder;
+}
+
+static bool mergeQueuedRelativeMouseMove(void* tailData, void* offeredData, void* context) {
+    PPACKET_HOLDER tailHolder = (PPACKET_HOLDER)tailData;
+    PPACKET_HOLDER offeredHolder = (PPACKET_HOLDER)offeredData;
+    int tailDeltaX;
+    int tailDeltaY;
+    int offeredDeltaX;
+    int offeredDeltaY;
+
+    (void)context;
+
+    if (tailHolder->channelId != CTRL_CHANNEL_MOUSE ||
+            offeredHolder->channelId != CTRL_CHANNEL_MOUSE ||
+            tailHolder->enetPacketFlags != offeredHolder->enetPacketFlags ||
+            tailHolder->packet.header.magic != offeredHolder->packet.header.magic ||
+            tailHolder->packet.header.magic != (AppVersionQuad[0] >= 5 ?
+                LE32(MOUSE_MOVE_REL_MAGIC_GEN5) : LE32(MOUSE_MOVE_REL_MAGIC))) {
+        return false;
+    }
+
+    tailDeltaX = (short)BE16(tailHolder->packet.mouseMoveRel.deltaX);
+    tailDeltaY = (short)BE16(tailHolder->packet.mouseMoveRel.deltaY);
+    offeredDeltaX = (short)BE16(offeredHolder->packet.mouseMoveRel.deltaX);
+    offeredDeltaY = (short)BE16(offeredHolder->packet.mouseMoveRel.deltaY);
+
+    // A vertical-only report retains the tail's horizontal direction. Only a
+    // non-zero sign reversal ends the current motion segment.
+    if ((tailDeltaX < 0 && offeredDeltaX > 0) ||
+            (tailDeltaX > 0 && offeredDeltaX < 0)) {
+        return false;
+    }
+
+    if (tailDeltaX + offeredDeltaX > INT16_MAX ||
+            tailDeltaX + offeredDeltaX < INT16_MIN ||
+            tailDeltaY + offeredDeltaY > INT16_MAX ||
+            tailDeltaY + offeredDeltaY < INT16_MIN) {
+        return false;
+    }
+
+    tailHolder->packet.mouseMoveRel.deltaX = BE16((short)(tailDeltaX + offeredDeltaX));
+    tailHolder->packet.mouseMoveRel.deltaY = BE16((short)(tailDeltaY + offeredDeltaY));
+    return true;
+}
+
+static bool queuedHolderIsRelativeMouseMove(void* data, void* context) {
+    PPACKET_HOLDER holder = (PPACKET_HOLDER)data;
+
+    (void)context;
+
+    return holder->channelId == CTRL_CHANNEL_MOUSE &&
+           holder->packet.header.magic == (AppVersionQuad[0] >= 5 ?
+               LE32(MOUSE_MOVE_REL_MAGIC_GEN5) : LE32(MOUSE_MOVE_REL_MAGIC));
+}
+
+typedef enum _RELATIVE_MOUSE_BATCH_BOUNDARY {
+    RELATIVE_MOUSE_BATCH_CONTINUES,
+    RELATIVE_MOUSE_BATCH_NON_RELATIVE,
+    RELATIVE_MOUSE_BATCH_REVERSAL,
+    RELATIVE_MOUSE_BATCH_OVERFLOW,
+} RELATIVE_MOUSE_BATCH_BOUNDARY;
+
+typedef struct _RELATIVE_MOUSE_BATCH_CONTEXT {
+    uint32_t relativeMouseMagic;
+    int totalDeltaX;
+    int totalDeltaY;
+    RELATIVE_MOUSE_BATCH_BOUNDARY boundary;
+} RELATIVE_MOUSE_BATCH_CONTEXT;
+
+static bool relativeMouseMoveCanBatch(void* data, void* context) {
+    PPACKET_HOLDER holder = (PPACKET_HOLDER)data;
+    RELATIVE_MOUSE_BATCH_CONTEXT* batchContext = (RELATIVE_MOUSE_BATCH_CONTEXT*)context;
+    int partialDeltaX;
+    int partialDeltaY;
+
+    if (holder->packet.header.magic != batchContext->relativeMouseMagic) {
+        batchContext->boundary = RELATIVE_MOUSE_BATCH_NON_RELATIVE;
+        return false;
+    }
+
+    partialDeltaX = (short)BE16(holder->packet.mouseMoveRel.deltaX);
+    partialDeltaY = (short)BE16(holder->packet.mouseMoveRel.deltaY);
+
+    if ((batchContext->totalDeltaX < 0 && partialDeltaX > 0) ||
+            (batchContext->totalDeltaX > 0 && partialDeltaX < 0)) {
+        batchContext->boundary = RELATIVE_MOUSE_BATCH_REVERSAL;
+        return false;
+    }
+
+    if (partialDeltaX + batchContext->totalDeltaX > INT16_MAX ||
+            partialDeltaX + batchContext->totalDeltaX < INT16_MIN ||
+            partialDeltaY + batchContext->totalDeltaY > INT16_MAX ||
+            partialDeltaY + batchContext->totalDeltaY < INT16_MIN) {
+        batchContext->boundary = RELATIVE_MOUSE_BATCH_OVERFLOW;
+        return false;
+    }
+
+    batchContext->boundary = RELATIVE_MOUSE_BATCH_CONTINUES;
+    return true;
+}
+
+static bool packetMagicMatches(void* data, void* context) {
+    PPACKET_HOLDER holder = (PPACKET_HOLDER)data;
+    uint32_t packetMagic = *(uint32_t*)context;
+
+    return holder->packet.header.magic == packetMagic;
+}
+
+typedef struct _PEN_BATCH_CONTEXT {
+    uint8_t eventType;
+    uint8_t penButtons;
+} PEN_BATCH_CONTEXT;
+
+static bool penPacketCanBatch(void* data, void* context) {
+    PPACKET_HOLDER holder = (PPACKET_HOLDER)data;
+    PEN_BATCH_CONTEXT* batchContext = (PEN_BATCH_CONTEXT*)context;
+
+    return holder->packet.header.magic == LE32(SS_PEN_MAGIC) &&
+           holder->packet.pen.eventType == batchContext->eventType &&
+           holder->packet.pen.penButtons == batchContext->penButtons;
+}
+
+static int offerSemanticPacketHolder(PPACKET_HOLDER holder) {
+    PPACKET_HOLDER evictedHolder = NULL;
+    int err;
+
+    err = LbqOfferQueueItemWithOldestEviction(&packetQueue, holder, &holder->entry,
+                                             queuedHolderIsRelativeMouseMove, NULL,
+                                             (void**)&evictedHolder);
+    if (evictedHolder != NULL) {
+        freePacketHolder(evictedHolder);
+    }
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
+    }
+
+    return err;
+}
+
+static void recordPacketQueueResidenceTime(PPACKET_HOLDER holder) {
+    uint64_t now = PltGetMicroseconds();
+    uint64_t residenceTimeUs = now >= holder->enqueueTimeUs ? now - holder->enqueueTimeUs : 0;
+
+    LbqRecordQueueResidenceTimeUs(&packetQueue, residenceTimeUs);
 }
 
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
@@ -327,11 +483,22 @@ static void inputSendThreadProc(void* context) {
 
     uint64_t lastMousePacketTime = 0;
     uint64_t lastPenPacketTime = 0;
+    bool bypassNextRelativeMouseThrottle = false;
 
     while (!PltIsThreadInterrupted(&inputSendThread)) {
+        bool flushAfterCurrentPacket = false;
+
         err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
         if (err != LBQ_SUCCESS) {
             return;
+        }
+        recordPacketQueueResidenceTime(holder);
+
+        // A non-relative packet interrupts the relative mouse segment, so the
+        // first relative packet after it must not inherit the prior segment's
+        // throttle deadline.
+        if (holder->packet.header.magic != relMouseMagicLE) {
+            bypassNextRelativeMouseThrottle = true;
         }
 
         // If it's a multi-controller packet, latch it by clearing currentQueuedControllerPacket.
@@ -355,59 +522,56 @@ static void inputSendThreadProc(void* context) {
         // If it's a relative mouse move packet, we can do batching
         else if (holder->packet.header.magic == relMouseMagicLE) {
             PPACKET_HOLDER mouseBatchHolder;
-            int totalDeltaX = (short)BE16(holder->packet.mouseMoveRel.deltaX);
-            int totalDeltaY = (short)BE16(holder->packet.mouseMoveRel.deltaY);
-            uint64_t now = PltGetMillis();
+            RELATIVE_MOUSE_BATCH_CONTEXT batchContext = {
+                .relativeMouseMagic = relMouseMagicLE,
+                .totalDeltaX = (short)BE16(holder->packet.mouseMoveRel.deltaX),
+                .totalDeltaY = (short)BE16(holder->packet.mouseMoveRel.deltaY),
+                .boundary = RELATIVE_MOUSE_BATCH_CONTINUES,
+            };
+            bool bypassMouseThrottle = bypassNextRelativeMouseThrottle;
+            uint64_t now;
 
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            bypassNextRelativeMouseThrottle = false;
+
+            for (;;) {
+                int pollResult;
+
+                batchContext.boundary = RELATIVE_MOUSE_BATCH_CONTINUES;
+                pollResult = LbqPollQueueElementIf(&packetQueue,
+                                                   relativeMouseMoveCanBatch,
+                                                   &batchContext,
+                                                   (void**)&mouseBatchHolder);
+                if (pollResult != LBQ_SUCCESS) {
+                    if (batchContext.boundary != RELATIVE_MOUSE_BATCH_CONTINUES) {
+                        flushAfterCurrentPacket = true;
+                    }
+                    if (batchContext.boundary == RELATIVE_MOUSE_BATCH_REVERSAL ||
+                            batchContext.boundary == RELATIVE_MOUSE_BATCH_OVERFLOW) {
+                        bypassNextRelativeMouseThrottle = true;
+                    }
+                    break;
+                }
+
+                recordPacketQueueResidenceTime(mouseBatchHolder);
+                batchContext.totalDeltaX += (short)BE16(mouseBatchHolder->packet.mouseMoveRel.deltaX);
+                batchContext.totalDeltaY += (short)BE16(mouseBatchHolder->packet.mouseMoveRel.deltaY);
+                freePacketHolder(mouseBatchHolder);
+            }
+
+            // Continuous motion remains rate-managed, but a ready semantic
+            // boundary takes priority over the batching delay.
+            now = PltGetMillis();
+            if (!flushAfterCurrentPacket && !bypassMouseThrottle &&
+                    now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
             }
 
-            for (;;) {
-                int partialDeltaX;
-                int partialDeltaY;
-
-                // Only adjacent relative mouse packets may be batched. Any
-                // other queued input packet is an ordering barrier.
-                if (LbqPeekQueueElement(&packetQueue, (void**)&mouseBatchHolder) != LBQ_SUCCESS ||
-                        mouseBatchHolder->packet.header.magic != relMouseMagicLE) {
-                    break;
-                }
-
-                partialDeltaX = (short)BE16(mouseBatchHolder->packet.mouseMoveRel.deltaX);
-                partialDeltaY = (short)BE16(mouseBatchHolder->packet.mouseMoveRel.deltaY);
-
-                // Horizontal direction changes are semantic barriers. A
-                // vertical-only event leaves the remembered direction intact.
-                if ((totalDeltaX < 0 && partialDeltaX > 0) ||
-                        (totalDeltaX > 0 && partialDeltaX < 0)) {
-                    break;
-                }
-
-                // Check for overflow
-                if (partialDeltaX + totalDeltaX > INT16_MAX ||
-                        partialDeltaX + totalDeltaX < INT16_MIN ||
-                        partialDeltaY + totalDeltaY > INT16_MAX ||
-                        partialDeltaY + totalDeltaY < INT16_MIN) {
-                    break;
-                }
-
-                if (LbqPollQueueElement(&packetQueue, (void**)&mouseBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                totalDeltaX += partialDeltaX;
-                totalDeltaY += partialDeltaY;
-                freePacketHolder(mouseBatchHolder);
-            }
-
             lastMousePacketTime = now;
 
-            holder->packet.mouseMoveRel.deltaX = BE16((short)totalDeltaX);
-            holder->packet.mouseMoveRel.deltaY = BE16((short)totalDeltaY);
+            holder->packet.mouseMoveRel.deltaX = BE16((short)batchContext.totalDeltaX);
+            holder->packet.mouseMoveRel.deltaY = BE16((short)batchContext.totalDeltaY);
         }
         // If it's an absolute mouse move packet, we should only send the latest
         else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
@@ -422,18 +586,18 @@ static void inputSendThreadProc(void* context) {
 
             for (;;) {
                 PPACKET_HOLDER mouseBatchHolder;
+                uint32_t absoluteMouseMagic = LE32(MOUSE_MOVE_ABS_MAGIC);
 
                 // Only adjacent absolute mouse packets may replace this one.
                 // Any other queued input packet is an ordering barrier.
-                if (LbqPeekQueueElement(&packetQueue, (void**)&mouseBatchHolder) != LBQ_SUCCESS ||
-                        mouseBatchHolder->packet.header.magic != LE32(MOUSE_MOVE_ABS_MAGIC)) {
+                if (LbqPollQueueElementIf(&packetQueue,
+                                          packetMagicMatches,
+                                          &absoluteMouseMagic,
+                                          (void**)&mouseBatchHolder) != LBQ_SUCCESS) {
                     break;
                 }
 
-                if (LbqPollQueueElement(&packetQueue, (void**)&mouseBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
+                recordPacketQueueResidenceTime(mouseBatchHolder);
                 freePacketHolder(holder);
                 holder = mouseBatchHolder;
             }
@@ -443,6 +607,10 @@ static void inputSendThreadProc(void* context) {
         // If it's a pen packet, we should only send the latest move or hover events
         else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
             uint64_t now = PltGetMillis();
+            PEN_BATCH_CONTEXT batchContext = {
+                .eventType = holder->packet.pen.eventType,
+                .penButtons = holder->packet.pen.penButtons,
+            };
 
             // Delay for batching if required
             if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
@@ -454,27 +622,14 @@ static void inputSendThreadProc(void* context) {
             for (;;) {
                 PPACKET_HOLDER penBatchHolder;
 
-                // Peek at the next packet
-                if (LbqPeekQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
+                if (LbqPollQueueElementIf(&packetQueue,
+                                          penPacketCanBatch,
+                                          &batchContext,
+                                          (void**)&penBatchHolder) != LBQ_SUCCESS) {
                     break;
                 }
 
-                // If it's not a pen packet, we're done
-                if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
-                    break;
-                }
-
-                // If the buttons or event type is different, we cannot batch
-                if (holder->packet.pen.penButtons != penBatchHolder->packet.pen.penButtons ||
-                    holder->packet.pen.eventType != penBatchHolder->packet.pen.eventType) {
-                    break;
-                }
-
-                // Remove the next packet
-                if (LbqPollQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
+                recordPacketQueueResidenceTime(penBatchHolder);
                 // Replace the current packet with the new one
                 freePacketHolder(holder);
                 holder = penBatchHolder;
@@ -580,9 +735,10 @@ static void inputSendThreadProc(void* context) {
             continue;
         }
 
-        // Keyboard and wheel packets are semantic barriers. Send them now even
-        // if more FIFO entries are waiting so ENet cannot defer the transition.
-        bool moreData = !inputPacketIsFlushBarrier(holder->channelId,
+        // Send explicit barriers and motion segments ending at a ready
+        // boundary now so ENet cannot defer the transition.
+        bool moreData = !flushAfterCurrentPacket &&
+                        !inputPacketIsFlushBarrier(holder->channelId,
                                                     holder->packet.header.magic) &&
                         LbqGetItemCount(&packetQueue) > 0;
 
@@ -684,6 +840,33 @@ int stopInputStream(void) {
     return 0;
 }
 
+void LiGetInputQueueStats(PLI_INPUT_QUEUE_STATS stats) {
+    LINKED_BLOCKING_QUEUE_STATS queueStats;
+
+    if (stats == NULL) {
+        return;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    if (!initialized) {
+        return;
+    }
+
+    LbqGetQueueStats(&packetQueue, &queueStats);
+    stats->currentDepth = (uint32_t)queueStats.currentDepth;
+    stats->maximumDepth = (uint32_t)queueStats.maximumDepth;
+    stats->enqueuedPackets = queueStats.enqueuedItems;
+    stats->dequeuedPackets = queueStats.dequeuedItems;
+    stats->mergedMouseMovePackets = queueStats.tailMerges;
+    stats->evictedMouseMovePackets = queueStats.oldestEvictions;
+    stats->rejectedPackets = queueStats.boundRejections;
+    stats->residenceSampleCount = queueStats.residenceSampleCount;
+    stats->p50ResidenceTimeUs = queueStats.p50ResidenceTimeUs;
+    stats->p95ResidenceTimeUs = queueStats.p95ResidenceTimeUs;
+    stats->p99ResidenceTimeUs = queueStats.p99ResidenceTimeUs;
+    stats->maximumResidenceTimeUs = queueStats.maximumResidenceTimeUs;
+}
+
 // Send a mouse move event to the streaming machine
 int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     PPACKET_HOLDER holder;
@@ -718,7 +901,12 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     holder->packet.mouseMoveRel.deltaX = BE16(deltaX);
     holder->packet.mouseMoveRel.deltaY = BE16(deltaY);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = LbqOfferQueueItemWithTailMerge(&packetQueue, holder, &holder->entry,
+                                        mergeQueuedRelativeMouseMove, NULL);
+    if (err == LBQ_MERGED) {
+        freePacketHolder(holder);
+        return LBQ_SUCCESS;
+    }
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
@@ -792,7 +980,6 @@ int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short refere
 // Send a mouse button event to the streaming machine
 int LiSendMouseButtonEvent(char action, int button) {
     PPACKET_HOLDER holder;
-    int err;
 
     if (!initialized) {
         return -2;
@@ -813,20 +1000,12 @@ int LiSendMouseButtonEvent(char action, int button) {
     holder->packet.mouseButton.header.magic = LE32(holder->packet.mouseButton.header.magic);
     holder->packet.mouseButton.button = (uint8_t)button;
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    return offerSemanticPacketHolder(holder);
 }
 
 // Send a key press event to the streaming machine
 int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags) {
     PPACKET_HOLDER holder;
-    int err;
 
     if (!initialized) {
         return -2;
@@ -837,7 +1016,7 @@ int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char fla
         return -1;
     }
 
-    holder->channelId = CTRL_CHANNEL_KEYBOARD;
+    holder->channelId = keyboardChannelId;
     holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     // For proper behavior, the MODIFIER flag must not be set on the modifier key down event itself
@@ -891,14 +1070,7 @@ int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char fla
     holder->packet.keyboard.modifiers = modifiers;
     holder->packet.keyboard.zero2 = 0;
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    return offerSemanticPacketHolder(holder);
 }
 
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
@@ -1171,11 +1343,8 @@ int LiSendHighResScrollEvent(short scrollAmount) {
             holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
             holder->packet.scroll.zero3 = 0;
 
-            err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+            err = offerSemanticPacketHolder(holder);
             if (err != LBQ_SUCCESS) {
-                LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-                Limelog("Input queue reached maximum size limit\n");
-                freePacketHolder(holder);
                 return err;
             }
 
@@ -1204,12 +1373,7 @@ int LiSendHighResScrollEvent(short scrollAmount) {
         holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
         holder->packet.scroll.zero3 = 0;
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-        }
+        err = offerSemanticPacketHolder(holder);
     }
 
     return err;
@@ -1250,12 +1414,7 @@ int LiSendHighResHScrollEvent(short scrollAmount) {
     holder->packet.hscroll.header.magic = LE32(SS_HSCROLL_MAGIC);
     holder->packet.hscroll.scrollAmount = BE16(scrollAmount);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
+    err = offerSemanticPacketHolder(holder);
 
     return err;
 }

@@ -100,6 +100,9 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // Requests strict ordering of mouse and keyboard input when supported by the host.
+    bool enableOrderedInput;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
@@ -845,6 +848,25 @@ int LiSendHighResScrollEvent(short scrollAmount);
 int LiSendHScrollEvent(signed char scrollClicks);
 int LiSendHighResHScrollEvent(short scrollAmount);
 
+// Snapshot of client input queue behavior since the input queue was initialized.
+typedef struct _LI_INPUT_QUEUE_STATS {
+    uint32_t currentDepth;
+    uint32_t maximumDepth;
+    uint64_t enqueuedPackets;
+    uint64_t dequeuedPackets;
+    uint64_t mergedMouseMovePackets;
+    uint64_t evictedMouseMovePackets;
+    uint64_t rejectedPackets;
+    uint64_t residenceSampleCount;
+    uint64_t p50ResidenceTimeUs;
+    uint64_t p95ResidenceTimeUs;
+    uint64_t p99ResidenceTimeUs;
+    uint64_t maximumResidenceTimeUs;
+} LI_INPUT_QUEUE_STATS, *PLI_INPUT_QUEUE_STATS;
+
+// Populates a synchronized snapshot of client input queue statistics.
+void LiGetInputQueueStats(PLI_INPUT_QUEUE_STATS stats);
+
 // This function returns a time in microseconds with an implementation-defined epoch.
 // It should only ever be compared with the return value from a previous call to itself.
 uint64_t LiGetMicroseconds(void);
@@ -1010,6 +1032,7 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_ORDERED_INPUT           0x04 // Strict ordering of mouse and keyboard input supported
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus

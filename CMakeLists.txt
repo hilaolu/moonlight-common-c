@@ -131,5 +131,63 @@ if (CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     )
     target_compile_definitions(input-stream-policy-test PRIVATE HAS_SOCKLEN_T)
     add_test(NAME input-stream-policy-test COMMAND input-stream-policy-test)
+
+    add_executable(ordered-input-policy-test tests/OrderedInputPolicyTest.c)
+    target_include_directories(ordered-input-policy-test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/enet/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/nanors
+      ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps
+      ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
+    )
+    target_compile_definitions(ordered-input-policy-test PRIVATE HAS_SOCKLEN_T)
+    add_test(NAME ordered-input-policy-test COMMAND ordered-input-policy-test)
+
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+      add_executable(input-stream-worker-test
+        tests/InputStreamWorkerTest.c
+        src/LinkedBlockingQueue.c
+        src/Platform.c
+      )
+      target_include_directories(input-stream-worker-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/enet/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/nanors
+        ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps
+        ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
+      )
+      target_compile_definitions(input-stream-worker-test PRIVATE HAS_SOCKLEN_T)
+      target_compile_options(input-stream-worker-test PRIVATE
+        -ffunction-sections
+        -fdata-sections
+        -Wno-unused-parameter
+      )
+      set_property(TARGET input-stream-worker-test APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--gc-sections")
+      find_package(Threads REQUIRED)
+      target_link_libraries(input-stream-worker-test PRIVATE Threads::Threads)
+      add_test(NAME input-stream-worker-test COMMAND input-stream-worker-test)
+
+      add_executable(linked-blocking-queue-atomic-test
+        tests/LinkedBlockingQueueAtomicTest.c
+        src/LinkedBlockingQueue.c
+        src/Platform.c
+      )
+      target_include_directories(linked-blocking-queue-atomic-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/enet/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/nanors
+        ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps
+        ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
+      )
+      target_compile_definitions(linked-blocking-queue-atomic-test PRIVATE HAS_SOCKLEN_T)
+      target_compile_options(linked-blocking-queue-atomic-test PRIVATE
+        -ffunction-sections
+        -fdata-sections
+        -Wno-unused-parameter
+      )
+      set_property(TARGET linked-blocking-queue-atomic-test APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--gc-sections")
+      target_link_libraries(linked-blocking-queue-atomic-test PRIVATE Threads::Threads)
+      add_test(NAME linked-blocking-queue-atomic-test COMMAND linked-blocking-queue-atomic-test)
+    endif()
   endif()
 endif()
