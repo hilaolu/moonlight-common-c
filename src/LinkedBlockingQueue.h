@@ -14,23 +14,6 @@ typedef bool (*PLBQ_TAIL_MERGE_CALLBACK)(void* tailData, void* offeredData, void
 typedef bool (*PLBQ_EVICTION_PREDICATE)(void* data, void* context);
 typedef bool (*PLBQ_POLL_PREDICATE)(void* data, void* context);
 
-#define LBQ_RESIDENCE_TIME_BUCKET_COUNT 66
-
-typedef struct _LINKED_BLOCKING_QUEUE_STATS {
-    int currentDepth;
-    int maximumDepth;
-    uint64_t enqueuedItems;
-    uint64_t dequeuedItems;
-    uint64_t tailMerges;
-    uint64_t oldestEvictions;
-    uint64_t boundRejections;
-    uint64_t residenceSampleCount;
-    uint64_t p50ResidenceTimeUs;
-    uint64_t p95ResidenceTimeUs;
-    uint64_t p99ResidenceTimeUs;
-    uint64_t maximumResidenceTimeUs;
-} LINKED_BLOCKING_QUEUE_STATS, *PLINKED_BLOCKING_QUEUE_STATS;
-
 typedef struct _LINKED_BLOCKING_QUEUE_ENTRY {
     struct _LINKED_BLOCKING_QUEUE_ENTRY* flink;
     struct _LINKED_BLOCKING_QUEUE_ENTRY* blink;
@@ -45,15 +28,6 @@ typedef struct _LINKED_BLOCKING_QUEUE {
     int sizeBound;
     int currentSize;
     int lifetimeSize;
-    int maximumSize;
-    uint64_t enqueuedItemCount;
-    uint64_t dequeuedItemCount;
-    uint64_t tailMergeCount;
-    uint64_t oldestEvictionCount;
-    uint64_t boundRejectionCount;
-    uint64_t residenceSampleCount;
-    uint64_t maximumResidenceTimeUs;
-    uint64_t residenceTimeHistogram[LBQ_RESIDENCE_TIME_BUCKET_COUNT];
     bool shutdown;
     bool draining;
     bool pendingUserWake;
@@ -81,5 +55,3 @@ void LbqSignalQueueShutdown(PLINKED_BLOCKING_QUEUE queueHead);
 void LbqSignalQueueDrain(PLINKED_BLOCKING_QUEUE queueHead);
 void LbqSignalQueueUserWake(PLINKED_BLOCKING_QUEUE queueHead);
 int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead);
-void LbqRecordQueueResidenceTimeUs(PLINKED_BLOCKING_QUEUE queueHead, uint64_t residenceTimeUs);
-void LbqGetQueueStats(PLINKED_BLOCKING_QUEUE queueHead, PLINKED_BLOCKING_QUEUE_STATS stats);

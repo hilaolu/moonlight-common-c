@@ -1,5 +1,4 @@
 #define PltGetMillis InputStreamWorkerTestGetMillis
-#define PltGetMicroseconds InputStreamWorkerTestGetMicroseconds
 #define PltSleepMs InputStreamWorkerTestSleepMs
 #define flushInputOnControlStream InputStreamWorkerTestFlush
 #define sendInputPacketOnControlStream InputStreamWorkerTestSend
@@ -9,7 +8,6 @@
 #include "../src/InputStream.c"
 
 #undef PltGetMillis
-#undef PltGetMicroseconds
 #undef PltSleepMs
 #undef flushInputOnControlStream
 #undef sendInputPacketOnControlStream
@@ -55,10 +53,6 @@ static int expectedSendCount;
 
 uint64_t InputStreamWorkerTestGetMillis(void) {
     return fakeNowMs;
-}
-
-uint64_t InputStreamWorkerTestGetMicroseconds(void) {
-    return fakeNowMs * 1000;
 }
 
 void InputStreamWorkerTestSleepMs(int ms) {
@@ -454,7 +448,6 @@ Exit:
 }
 
 static int testQueueCompression(void) {
-    LI_INPUT_QUEUE_STATS stats;
     int result = 0;
     int i;
 
@@ -474,16 +467,6 @@ static int testQueueCompression(void) {
         goto Exit;
     }
 
-    memset(&stats, 0, sizeof(stats));
-    LiGetInputQueueStats(&stats);
-    CHECK(stats.currentDepth == 1);
-    CHECK(stats.maximumDepth == 1);
-    CHECK(stats.enqueuedPackets == 1);
-    CHECK(stats.dequeuedPackets == 0);
-    CHECK(stats.mergedMouseMovePackets == MAX_QUEUED_INPUT_PACKETS);
-    CHECK(stats.evictedMouseMovePackets == 0);
-    CHECK(stats.rejectedPackets == 0);
-
     inputSendThreadProc(NULL);
 
     CHECK(sentInputCount == 1);
@@ -494,21 +477,6 @@ static int testQueueCompression(void) {
     CHECK(sentInputs[0].sleepCountBeforeSend == 0);
     CHECK(sleepCount == 0);
     CHECK(flushCount == 0);
-
-    memset(&stats, 0, sizeof(stats));
-    LiGetInputQueueStats(&stats);
-    CHECK(stats.currentDepth == 0);
-    CHECK(stats.maximumDepth == 1);
-    CHECK(stats.enqueuedPackets == 1);
-    CHECK(stats.dequeuedPackets == 1);
-    CHECK(stats.mergedMouseMovePackets == MAX_QUEUED_INPUT_PACKETS);
-    CHECK(stats.evictedMouseMovePackets == 0);
-    CHECK(stats.rejectedPackets == 0);
-    CHECK(stats.residenceSampleCount == 1);
-    CHECK(stats.p50ResidenceTimeUs == 0);
-    CHECK(stats.p95ResidenceTimeUs == 0);
-    CHECK(stats.p99ResidenceTimeUs == 0);
-    CHECK(stats.maximumResidenceTimeUs == 0);
 
 Exit:
     initialized = false;
@@ -690,7 +658,6 @@ Exit:
 }
 
 static int testSemanticOnlySaturationRejectsWithoutEviction(void) {
-    LI_INPUT_QUEUE_STATS stats;
     int result = 0;
     int i;
 
@@ -706,15 +673,6 @@ static int testSemanticOnlySaturationRejectsWithoutEviction(void) {
     // transition must fail explicitly so the caller can surface overload.
     CHECK(LiSendKeyboardEvent(0x41, KEY_ACTION_UP, 0) == LBQ_BOUND_EXCEEDED);
 
-    LiGetInputQueueStats(&stats);
-    CHECK(stats.currentDepth == MAX_QUEUED_INPUT_PACKETS);
-    CHECK(stats.maximumDepth == MAX_QUEUED_INPUT_PACKETS);
-    CHECK(stats.enqueuedPackets == MAX_QUEUED_INPUT_PACKETS);
-    CHECK(stats.dequeuedPackets == 0);
-    CHECK(stats.mergedMouseMovePackets == 0);
-    CHECK(stats.evictedMouseMovePackets == 0);
-    CHECK(stats.rejectedPackets == 1);
-
 Exit:
     initialized = false;
     cleanupWorkerState();
@@ -729,8 +687,6 @@ int main(void) {
     AppVersionQuad[2] = 431;
     AppVersionQuad[3] = -1;
 
-    // Run the metrics scenario first so it observes a fresh process-lifetime
-    // counter snapshot.
     result = testQueueCompression();
     if (result != 0) {
         return result;

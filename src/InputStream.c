@@ -1,12 +1,10 @@
 #include "Limelight-internal.h"
 #include "InputStreamPolicy.h"
-#include "OrderedInputPolicy.h"
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
 static bool initialized;
 static bool encryptedControlStream;
-static uint8_t keyboardChannelId = CTRL_CHANNEL_KEYBOARD;
 static bool needsBatchedScroll;
 static int batchedScrollDelta;
 static PPLT_CRYPTO_CONTEXT cryptoContext;
@@ -54,8 +52,6 @@ typedef struct _PACKET_HOLDER {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
     uint32_t enetPacketFlags;
     uint8_t channelId;
-    uint64_t enqueueTimeUs;
-
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
     // sent to the host.
@@ -90,10 +86,6 @@ static struct {
 // Initializes the input stream
 int initializeInputStream(void) {
     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
-    keyboardChannelId = orderedInputChannel(CTRL_CHANNEL_KEYBOARD,
-                                            &StreamConfig,
-                                            SunshineFeatureFlags);
-
     // Set a high maximum queue size limit to ensure input isn't dropped
     // while the input send thread is blocked for short periods.
     LbqInitializeLinkedBlockingQueue(&packetQueue, MAX_QUEUED_INPUT_PACKETS);
@@ -223,10 +215,6 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
             // Otherwise we'll have to allocate
             holder = malloc(sizeof(*holder));
         }
-    }
-
-    if (holder != NULL) {
-        holder->enqueueTimeUs = PltGetMicroseconds();
     }
 
     return holder;
@@ -371,13 +359,6 @@ static int offerSemanticPacketHolder(PPACKET_HOLDER holder) {
     return err;
 }
 
-static void recordPacketQueueResidenceTime(PPACKET_HOLDER holder) {
-    uint64_t now = PltGetMicroseconds();
-    uint64_t residenceTimeUs = now >= holder->enqueueTimeUs ? now - holder->enqueueTimeUs : 0;
-
-    LbqRecordQueueResidenceTimeUs(&packetQueue, residenceTimeUs);
-}
-
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
     SOCK_RET err;
 
@@ -492,8 +473,6 @@ static void inputSendThreadProc(void* context) {
         if (err != LBQ_SUCCESS) {
             return;
         }
-        recordPacketQueueResidenceTime(holder);
-
         // A non-relative packet interrupts the relative mouse segment, so the
         // first relative packet after it must not inherit the prior segment's
         // throttle deadline.
@@ -552,7 +531,6 @@ static void inputSendThreadProc(void* context) {
                     break;
                 }
 
-                recordPacketQueueResidenceTime(mouseBatchHolder);
                 batchContext.totalDeltaX += (short)BE16(mouseBatchHolder->packet.mouseMoveRel.deltaX);
                 batchContext.totalDeltaY += (short)BE16(mouseBatchHolder->packet.mouseMoveRel.deltaY);
                 freePacketHolder(mouseBatchHolder);
@@ -597,7 +575,6 @@ static void inputSendThreadProc(void* context) {
                     break;
                 }
 
-                recordPacketQueueResidenceTime(mouseBatchHolder);
                 freePacketHolder(holder);
                 holder = mouseBatchHolder;
             }
@@ -629,7 +606,6 @@ static void inputSendThreadProc(void* context) {
                     break;
                 }
 
-                recordPacketQueueResidenceTime(penBatchHolder);
                 // Replace the current packet with the new one
                 freePacketHolder(holder);
                 holder = penBatchHolder;
@@ -840,33 +816,6 @@ int stopInputStream(void) {
     return 0;
 }
 
-void LiGetInputQueueStats(PLI_INPUT_QUEUE_STATS stats) {
-    LINKED_BLOCKING_QUEUE_STATS queueStats;
-
-    if (stats == NULL) {
-        return;
-    }
-
-    memset(stats, 0, sizeof(*stats));
-    if (!initialized) {
-        return;
-    }
-
-    LbqGetQueueStats(&packetQueue, &queueStats);
-    stats->currentDepth = (uint32_t)queueStats.currentDepth;
-    stats->maximumDepth = (uint32_t)queueStats.maximumDepth;
-    stats->enqueuedPackets = queueStats.enqueuedItems;
-    stats->dequeuedPackets = queueStats.dequeuedItems;
-    stats->mergedMouseMovePackets = queueStats.tailMerges;
-    stats->evictedMouseMovePackets = queueStats.oldestEvictions;
-    stats->rejectedPackets = queueStats.boundRejections;
-    stats->residenceSampleCount = queueStats.residenceSampleCount;
-    stats->p50ResidenceTimeUs = queueStats.p50ResidenceTimeUs;
-    stats->p95ResidenceTimeUs = queueStats.p95ResidenceTimeUs;
-    stats->p99ResidenceTimeUs = queueStats.p99ResidenceTimeUs;
-    stats->maximumResidenceTimeUs = queueStats.maximumResidenceTimeUs;
-}
-
 // Send a mouse move event to the streaming machine
 int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     PPACKET_HOLDER holder;
@@ -1016,7 +965,7 @@ int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char fla
         return -1;
     }
 
-    holder->channelId = keyboardChannelId;
+    holder->channelId = CTRL_CHANNEL_KEYBOARD;
     holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     // For proper behavior, the MODIFIER flag must not be set on the modifier key down event itself

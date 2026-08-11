@@ -132,17 +132,6 @@ if (CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     target_compile_definitions(input-stream-policy-test PRIVATE HAS_SOCKLEN_T)
     add_test(NAME input-stream-policy-test COMMAND input-stream-policy-test)
 
-    add_executable(ordered-input-policy-test tests/OrderedInputPolicyTest.c)
-    target_include_directories(ordered-input-policy-test PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/enet/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/nanors
-      ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps
-      ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
-    )
-    target_compile_definitions(ordered-input-policy-test PRIVATE HAS_SOCKLEN_T)
-    add_test(NAME ordered-input-policy-test COMMAND ordered-input-policy-test)
-
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
       add_executable(input-stream-worker-test
         tests/InputStreamWorkerTest.c
