@@ -210,11 +210,11 @@ void PltDetachThread(PLT_THREAD* thread) {
 }
 
 bool PltIsThreadInterrupted(PLT_THREAD* thread) {
-    return thread->cancelled;
+    return PltAtomicLoadBoolRelaxed(&thread->cancelled);
 }
 
 void PltInterruptThread(PLT_THREAD* thread) {
-    thread->cancelled = true;
+    PltAtomicStoreBoolRelaxed(&thread->cancelled, true);
 }
 
 #ifdef __WIIU__
@@ -235,7 +235,7 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
     ctx->context = context;
     ctx->name = name;
 
-    thread->cancelled = false;
+    PltAtomicStoreBoolRelaxed(&thread->cancelled, false);
 
 #if defined(LC_WINDOWS)
     {

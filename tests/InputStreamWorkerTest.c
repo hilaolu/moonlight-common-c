@@ -105,7 +105,7 @@ int InputStreamWorkerTestSend(unsigned char* data, int length, uint8_t channelId
     // puts the next motion inside the worker's one-millisecond throttle window.
     if (sentInputCount == 1) {
         if (testScenario == TEST_QUEUE_COMPRESSION) {
-            inputSendThread.cancelled = true;
+            PltInterruptThread(&inputSendThread);
         }
         else if (testScenario == TEST_SATURATED_BUTTON_RELEASE ||
                  testScenario == TEST_SATURATED_KEY_UP ||
@@ -149,7 +149,7 @@ int InputStreamWorkerTestSend(unsigned char* data, int length, uint8_t channelId
         enqueueResult = LiSendMouseMoveEvent(1, 4);
     }
     else if (sentInputCount == expectedSendCount) {
-        inputSendThread.cancelled = true;
+        PltInterruptThread(&inputSendThread);
     }
 
     return 0;
@@ -210,8 +210,8 @@ static int setupWorkerState(TEST_SCENARIO scenario, int sendCount) {
     expectedSendCount = sendCount;
 
     encryptedControlStream = true;
-    initialized = true;
-    inputSendThread.cancelled = false;
+    setInputStreamInitialized(true);
+    PltAtomicStoreBoolRelaxed(&inputSendThread.cancelled, false);
 
     if (LbqInitializeLinkedBlockingQueue(&packetQueue, MAX_QUEUED_INPUT_PACKETS) != 0) {
         return -1;
@@ -233,6 +233,40 @@ static int setupWorkerState(TEST_SCENARIO scenario, int sendCount) {
         goto Exit; \
     } \
 } while (0)
+
+static int publishedInputPayload;
+static int observedInputPayload;
+
+static void inputStateReaderThreadProc(void* context) {
+    (void)context;
+
+    while (!inputStreamIsInitialized()) {
+        InputStreamWorkerTestSleepMs(1);
+    }
+
+    // This non-atomic read is safe only if the initialized flag publishes the
+    // preceding write with release/acquire ordering.
+    observedInputPayload = publishedInputPayload;
+}
+
+static int testInputStatePublication(void) {
+    PLT_THREAD readerThread;
+
+    setInputStreamInitialized(false);
+    publishedInputPayload = 0;
+    observedInputPayload = 0;
+
+    if (PltCreateThread("InputStateTest", inputStateReaderThreadProc, NULL, &readerThread) != 0) {
+        return __LINE__;
+    }
+
+    publishedInputPayload = 0x13579BDF;
+    setInputStreamInitialized(true);
+    PltJoinThread(&readerThread);
+    setInputStreamInitialized(false);
+
+    return observedInputPayload == publishedInputPayload ? 0 : __LINE__;
+}
 
 static int testMouseButtonBarrier(void) {
     int result = 0;
@@ -262,7 +296,7 @@ static int testMouseButtonBarrier(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -295,7 +329,7 @@ static int testKeyboardBarrier(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -328,7 +362,7 @@ static int testWheelBarrier(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -370,7 +404,7 @@ static int testHorizontalReversal(void) {
     CHECK(flushCount == 1);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -412,7 +446,7 @@ static int testArithmeticOverflow(void) {
     CHECK(flushCount == 1);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -442,7 +476,7 @@ static int testContinuousSameDirection(void) {
     CHECK(flushCount == 1);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -479,7 +513,7 @@ static int testQueueCompression(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -523,7 +557,7 @@ static int testSaturatedButtonRelease(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -567,7 +601,7 @@ static int testSaturatedKeyUp(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -612,7 +646,7 @@ static int testSaturatedVerticalWheel(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -652,7 +686,7 @@ static int testSaturatedHorizontalWheel(void) {
     CHECK(flushCount == 0);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -674,7 +708,7 @@ static int testSemanticOnlySaturationRejectsWithoutEviction(void) {
     CHECK(LiSendKeyboardEvent(0x41, KEY_ACTION_UP, 0) == LBQ_BOUND_EXCEEDED);
 
 Exit:
-    initialized = false;
+    setInputStreamInitialized(false);
     cleanupWorkerState();
     return result;
 }
@@ -686,6 +720,11 @@ int main(void) {
     AppVersionQuad[1] = 1;
     AppVersionQuad[2] = 431;
     AppVersionQuad[3] = -1;
+
+    result = testInputStatePublication();
+    if (result != 0) {
+        return result;
+    }
 
     result = testQueueCompression();
     if (result != 0) {

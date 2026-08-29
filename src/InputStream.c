@@ -3,7 +3,7 @@
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
-static bool initialized;
+static PLT_ATOMIC_BOOL initialized = PLT_ATOMIC_BOOL_INITIALIZER(false);
 static bool encryptedControlStream;
 static bool needsBatchedScroll;
 static int batchedScrollDelta;
@@ -83,8 +83,19 @@ static struct {
     bool dirty; // Update ready to send (queued packet holder in packetQueue)
 } currentGamepadSensorState[MAX_GAMEPADS][MAX_MOTION_EVENTS];
 
+static bool inputStreamIsInitialized(void) {
+    // Acquire pairs with the release in startInputStream() so input producers
+    // see all stream and queue state initialized before input becomes enabled.
+    return PltAtomicLoadBoolAcquire(&initialized);
+}
+
+static void setInputStreamInitialized(bool newValue) {
+    PltAtomicStoreBoolRelease(&initialized, newValue);
+}
+
 // Initializes the input stream
 int initializeInputStream(void) {
+    setInputStreamInitialized(false);
     memcpy(currentAesIv, StreamConfig.remoteInputAesIv, sizeof(currentAesIv));
     // Set a high maximum queue size limit to ensure input isn't dropped
     // while the input send thread is blocked for short periods.
@@ -785,7 +796,7 @@ int startInputStream(void) {
     }
 
     // Allow input packets to be queued now
-    initialized = true;
+    setInputStreamInitialized(true);
 
     // GFE will not send haptics events without this magic packet first
     sendEnableHaptics();
@@ -796,7 +807,7 @@ int startInputStream(void) {
 // Stops the input stream
 int stopInputStream(void) {
     // No more packets should be queued now
-    initialized = false;
+    setInputStreamInitialized(false);
     LbqSignalQueueShutdown(&packetHolderFreeList);
 
     // Signal the input send thread to drain all pending
@@ -821,7 +832,7 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -870,7 +881,7 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -930,7 +941,7 @@ int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short refere
 int LiSendMouseButtonEvent(char action, int button) {
     PPACKET_HOLDER holder;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -956,7 +967,7 @@ int LiSendMouseButtonEvent(char action, int button) {
 int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags) {
     PPACKET_HOLDER holder;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1030,7 +1041,7 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length) {
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1065,7 +1076,7 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
     int err;
     bool enqueueHolder = false;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1246,7 +1257,7 @@ int LiSendHighResScrollEvent(short scrollAmount) {
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1338,7 +1349,7 @@ int LiSendHighResHScrollEvent(short scrollAmount) {
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1377,7 +1388,7 @@ int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y, fl
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1426,7 +1437,7 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1477,7 +1488,7 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepa
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1524,7 +1535,7 @@ int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType, uin
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1577,7 +1588,7 @@ int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, fl
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
@@ -1648,7 +1659,7 @@ int LiSendControllerBatteryEvent(uint8_t controllerNumber, uint8_t batteryState,
     PPACKET_HOLDER holder;
     int err;
 
-    if (!initialized) {
+    if (!inputStreamIsInitialized()) {
         return -2;
     }
 
